@@ -208,11 +208,20 @@ ENV_FILE="$HOME/.config/oracle-n8n/.env"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 [[ -f "$ENV_FILE" ]] || { warn "missing $ENV_FILE: run scripts/setup-oracle.sh first."; exit 1; }
 
-# ns_of DOMAIN prints its nameservers as seen by public DNS (1.1.1.1).
+# ns_of DOMAIN prints its nameservers as seen by public DNS. Google's resolver
+# is used because 1.1.1.1 can keep serving the old nameservers for hours.
 ns_of() {
-  if command -v dig >/dev/null 2>&1; then dig +short NS "$1" @1.1.1.1
-  elif command -v nslookup >/dev/null 2>&1; then nslookup -type=NS "$1" 1.1.1.1 2>/dev/null | awk '/nameserver/ {print $NF}'
-  else return 1; fi
+  if command -v dig >/dev/null 2>&1; then dig +short NS "$1" @8.8.8.8
+  elif command -v nslookup >/dev/null 2>&1; then nslookup -type=NS "$1" 8.8.8.8 2>/dev/null | awk '/nameserver/ {print $NF}'
+  else # DNS-over-HTTPS: needs only curl
+    curl -s "https://dns.google/resolve?name=$1&type=NS" \
+      | grep -oE '"data": ?"[^"]+"' | sed -E 's/.*"([^"]+)"$/\1/'
+  fi
+}
+
+# dns_status NAME prints Google DNS's answer status for NAME (0 = exists, 3 = NXDOMAIN).
+dns_status() {
+  curl -s "https://dns.google/resolve?name=$1&type=A" | grep -oE '"Status": ?[0-9]+' | grep -oE '[0-9]+$'
 }
 
 banner "Public domain for n8n via Cloudflare Tunnel + Access"
@@ -242,7 +251,7 @@ pause
 # ── 3 ────────────────────────────────────────────────────────────────────
 stage "Add $ZONE to Cloudflare"
 open_url "https://dash.cloudflare.com/"
-step "Sign up / sign in. Click 'Add a domain' (or 'Onboard a domain') → enter $ZONE."
+step "Sign up / sign in. Add a site → 'Connect a domain' (NOT Transfer) → enter $ZONE."
 step "Choose the Free plan."
 step "Review the DNS records Cloudflare imported: compare with the list from stage 2 and add"
 step "anything missing. Do NOT add a record for $N8N_DOMAIN; the tunnel creates it later."
@@ -294,9 +303,10 @@ while :; do
   warn "That doesn't look like a tunnel token (a long base64 string); try again."
 done
 write_env CLOUDFLARE_TUNNEL_TOKEN "$CLOUDFLARE_TUNNEL_TOKEN"
-step "Click Next to reach 'Route traffic' / 'Public hostnames' and add:"
+step "Then add a route: tunnel page → Routes → 'Add route' → 'Published application'"
+step "(older UI: 'Public hostnames'). NOT a private network route. Fill in:"
 printf '\n      Subdomain %s%s%s · Domain %s%s%s · Path (empty)\n' "$BOLD" "$SUB" "$RESET" "$BOLD" "$ZONE" "$RESET"
-printf '      Service type %sHTTP%s · URL %sn8n:5678%s\n\n' "$BOLD" "$RESET" "$BOLD" "$RESET"
+printf '      Service URL %shttp://n8n:5678%s  (older UI: type HTTP + URL n8n:5678)\n\n' "$BOLD" "$RESET"
 note "'n8n' is the container name inside the Docker network; cloudflared reaches it there."
 step "Save. Cloudflare creates the DNS record for $N8N_DOMAIN automatically."
 pause
@@ -325,6 +335,11 @@ stage "Deploy n8n with the domain"
 say "Re-uploads stack/ with the domain settings and starts the cloudflared container."
 if confirm "Deploy now?"; then
   "$REPO_DIR/scripts/deploy.sh"
+  if [[ "$(dns_status "$N8N_DOMAIN")" != "0" ]]; then
+    warn "$N8N_DOMAIN has no DNS record yet. In Cloudflare check: the zone $ZONE is Active, and"
+    warn "the tunnel has a public hostname for it (DNS → Records should show a CNAME '$SUB'"
+    warn "→ <tunnel-id>.cfargotunnel.com, Proxied). Then re-run this wizard."
+  fi
   say "Checking through Cloudflare (DNS can take a minute)…"
   web="" root=""
   for _ in $(seq 1 24); do
@@ -333,6 +348,7 @@ if confirm "Deploy now?"; then
     sleep 5
   done
   root=$(curl -s -o /dev/null -w '%{http_code}' "https://$N8N_DOMAIN/" || true)
+  [[ "$web" == "000" ]] && warn "000 = this machine can't resolve or reach $N8N_DOMAIN (DNS missing or cached as missing)."
   if [[ "$web" == "404" ]]; then printf '  %s✓ tunnel + webhook bypass work%s (n8n answered 404 for an unknown webhook)\n' "$GREEN" "$RESET"
   else warn "webhook probe answered '$web' (expected 404). 530/1033 = tunnel not connected; 302/403 = bypass app missing."; fi
   if [[ "$root" == "302" || "$root" == "403" ]]; then printf '  %s✓ editor is behind Access%s (HTTP %s)\n' "$GREEN" "$RESET" "$root"
