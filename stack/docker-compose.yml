@@ -63,6 +63,23 @@ services:
     depends_on:
       - n8n
 
+  # english-tutor (separate repo). Its scripts/deploy.sh builds the image and ships it with
+  # `docker load`, so it is never pulled. cloudflared and n8n reach it as http://app:3000.
+  app:
+    image: english-tutor:latest
+    pull_policy: never
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    env_file:
+      - path: english-tutor.env   # AI_* keys, uploaded by english-tutor's deploy.sh
+        required: false
+    environment:
+      DATABASE_URL: postgresql://n8n:${POSTGRES_PASSWORD}@postgres:5432/english_tutor
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 volumes:
   db-data:
   n8n-data:

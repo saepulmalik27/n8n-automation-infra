@@ -12,7 +12,9 @@ Asal-usul: wizard ini dipindah dari `my-profile/docs/infra/oracle-n8n/` (tiket `
 | --------------------------- | --------------------------------------------------------------------------- |
 | `stack/docker-compose.yml`  | n8n `2.47.7` + `pgvector/pgvector:0.8.1-pg17`, port hanya di `127.0.0.1`    |
 | `stack/init/01-knowledge.sql` | Membuat DB `knowledge` + extension `vector` (hanya saat volume masih kosong) |
-| `stack/backup.sh`           | `pg_dumpall` harian ke `~/backups` di server, simpan 7 hari                 |
+| `stack/init/03-english-tutor-app.sql` | Membuat DB `english_tutor` untuk service `app` (repo english-tutor) |
+| `workflows/english-tutor-nightly-job.json` | Workflow n8n: tiap 03:00 WIB memanggil `http://app:3000/api/jobs/generate` (jaringan Docker internal) dengan credential Header Auth `english-tutor job secret` (`x-job-secret` = `JOB_SECRET`). Secret tidak ada di JSON. |
+| `stack/backup.sh`           | `pg_dumpall` harian ke `~/backups` di server (7 hari) + salinan ke Cloudflare R2 |
 | `scripts/setup-oracle.sh`   | Wizard 9 tahap: akun Oracle → Pay-As-You-Go + budget → VM A1 → Docker → deploy → backup key → tunnel              |
 | `scripts/setup-domain.sh`  | Wizard domain publik: DNS ke Cloudflare → Tunnel → Access → deploy         |
 | `scripts/deploy.sh`         | Upload `stack/` ke `~/n8n` di server lalu `docker compose up -d`            |
@@ -77,6 +79,23 @@ memasang Cloudflare Access. Hasilnya:
 Konsekuensi privasi: Cloudflare membuka TLS di edge-nya, jadi isi request lewat Cloudflare.
 Data tetap tersimpan hanya di VPS.
 
+### Subdomain tambahan untuk aplikasi lain
+
+Zona dan tunnel `oracle-n8n` sudah ada, jadi aplikasi baru di stack ini cukup dua langkah manual
+di [Cloudflare One](https://one.dash.cloudflare.com/), tanpa wizard. Contoh `english-tutor`
+(dipasang 2026-11-18):
+
+1. Networks → Tunnels → `oracle-n8n` → Routes → Add route → Published application:
+   subdomain `tutor`, domain `saepulmalik.my.id`, path kosong, Service URL `http://app:3000`
+   (nama service di compose + port container). DNS dibuat otomatis.
+2. Access → Applications → Add an application → Self-hosted: domain `tutor.saepulmalik.my.id`,
+   session duration 1 month, policy Allow → Emails → email pemilik, login One-time PIN.
+   Tanpa bypass: job internal dipanggil n8n lewat jaringan Docker (`http://app:3000`), bukan
+   lewat domain.
+
+Cek: `curl -s -o /dev/null -w '%{http_code}' https://tutor.saepulmalik.my.id/` harus `302` ke
+login Access. Sebelum container `app` jalan, setelah OTP Cloudflare menampilkan 502.
+
 ## Sumopod
 
 Per 2026-11-15 belum ada workflow di instance Sumopod, jadi tidak ada yang perlu dimigrasi.
@@ -87,7 +106,29 @@ Workflow baru dibuat langsung di n8n Oracle.
 - **Backup `N8N_ENCRYPTION_KEY`** ke password manager (wizard tahap 8, entri `oracle-n8n`). Wizard
   meminta key ditempel balik dari password manager untuk memastikan tersimpan utuh. Tanpa key ini,
   credential n8n tidak bisa dipulihkan dari backup database.
-- Backup harian hanya ada di disk VPS yang sama. Tarik ke lokal secara berkala (perintah `scp` di atas).
+- Backup harian (02:00) disalin juga ke Cloudflare R2 (`R2_*` di `~/.config/oracle-n8n/.env`,
+  bucket `oracle-n8n-backups/pg/`, token hanya Object Read & Write untuk bucket itu). VPS menyimpan
+  7 hari; R2 menyimpan semua salinan kecuali bucket diberi lifecycle rule. rclone memakai
+  `NO_HEAD=true` karena rclone 1.60 memeriksa upload dengan `HEAD ?versionId=` yang dijawab R2 501.
+- Restore dari R2 (diuji 2026-11-18 ke container sementara, ketiga database utuh):
+
+  ```bash
+  ssh oracle-n8n
+  set -a; source ~/n8n/.env; set +a
+  export RCLONE_CONFIG_R2_TYPE=s3 RCLONE_CONFIG_R2_PROVIDER=Cloudflare RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true \
+    RCLONE_CONFIG_R2_ENDPOINT="$R2_ENDPOINT" RCLONE_CONFIG_R2_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" \
+    RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+  rclone ls "r2:$R2_BUCKET/pg"                        # pilih tanggal
+  rclone copy "r2:$R2_BUCKET/pg/pg-YYYY-MM-DD.sql.gz" /tmp/restore
+  # coba dulu di container sementara, bukan di postgres yang jalan:
+  docker run -d --rm --name restore-test -e POSTGRES_PASSWORD=x pgvector/pgvector:0.8.1-pg17
+  gunzip -c /tmp/restore/pg-*.sql.gz | docker exec -i restore-test psql -U postgres -q
+  docker stop restore-test
+  ```
+
+  Restore ke VPS baru: deploy stack dengan volume kosong, lalu jalankan `psql` yang sama ke
+  container `postgres` (`docker compose exec -T postgres psql -U n8n -d postgres`). Credential n8n
+  hanya terbaca dengan `N8N_ENCRYPTION_KEY` yang sama.
 - **Akun Pay-As-You-Go, bukan Free Tier** (keputusan 2026-11-15). Di akun Free Tier, VM Always Free
   yang menganggur (CPU, network, dan memory di bawah 20% p95 selama 7 hari) bisa diambil Oracle
   beserta disknya. Akun PAYG tidak terkena aturan itu, dan resource Always Free tetap gratis.

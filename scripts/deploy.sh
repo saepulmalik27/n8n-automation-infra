@@ -37,6 +37,11 @@ tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
       "$N8N_DOMAIN" "$N8N_DOMAIN" "$N8N_DOMAIN"
     printf 'N8N_PROXY_HOPS=1\nCLOUDFLARE_TUNNEL_TOKEN=%s\nCOMPOSE_PROFILES=tunnel\n' "$CLOUDFLARE_TUNNEL_TOKEN"
   fi
+  # Off-VPS backup copy to Cloudflare R2 (backup.sh skips it when these are absent).
+  if [[ -n "${R2_BUCKET:-}" ]]; then
+    printf 'R2_BUCKET=%s\nR2_ENDPOINT=%s\nR2_ACCESS_KEY_ID=%s\nR2_SECRET_ACCESS_KEY=%s\n' \
+      "$R2_BUCKET" "$R2_ENDPOINT" "$R2_ACCESS_KEY_ID" "$R2_SECRET_ACCESS_KEY"
+  fi
 } > "$tmp/.env" )
 [[ -n "${N8N_DOMAIN:-}" && -n "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]] \
   && echo "→ public domain: https://$N8N_DOMAIN (Cloudflare Tunnel)" \
@@ -46,6 +51,10 @@ echo "→ uploading stack/ to $target:~/n8n"
 ssh "${opts[@]}" "$target" 'mkdir -p ~/n8n/init && chmod 700 ~/n8n'
 scp "${opts[@]}" -q "$REPO_DIR/stack/docker-compose.yml" "$REPO_DIR/stack/backup.sh" "$tmp/.env" "$target:n8n/"
 scp "${opts[@]}" -q "$REPO_DIR"/stack/init/*.sql "$target:n8n/init/"
+
+if [[ -n "${R2_BUCKET:-}" ]]; then
+  ssh "${opts[@]}" "$target" 'command -v rclone >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq rclone; }'
+fi
 
 echo "→ starting containers"
 ssh "${opts[@]}" "$target" 'chmod 600 ~/n8n/.env && chmod +x ~/n8n/backup.sh && cd ~/n8n && docker compose pull -q && docker compose up -d --remove-orphans && docker compose ps'
